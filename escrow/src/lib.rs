@@ -13,6 +13,8 @@ pub struct InvoiceEscrow {
     pub invoice_id: Symbol,
     /// SME wallet that receives liquidity
     pub sme_address: Address,
+    /// Administrator authorized to update maturity
+    pub admin: Address,
     /// Total amount in smallest unit (e.g. stroops for XLM)
     pub amount: i128,
     /// Funding target must be met to release to SME
@@ -37,6 +39,7 @@ impl LiquifactEscrow {
         env: Env,
         invoice_id: Symbol,
         sme_address: Address,
+        admin: Address,
         amount: i128,
         yield_bps: i64,
         maturity: u64,
@@ -44,6 +47,7 @@ impl LiquifactEscrow {
         let escrow = InvoiceEscrow {
             invoice_id: invoice_id.clone(),
             sme_address: sme_address.clone(),
+            admin: admin.clone(),
             amount,
             funding_target: amount,
             funded_amount: 0,
@@ -90,6 +94,32 @@ impl LiquifactEscrow {
         env.storage()
             .instance()
             .set(&symbol_short!("escrow"), &escrow);
+        escrow
+    }
+
+    /// Update maturity timestamp. Only allowed by admin in Open state.
+    pub fn update_maturity(env: Env, new_maturity: u64) -> InvoiceEscrow {
+        let mut escrow = Self::get_escrow(env.clone());
+
+        // Strict authorization check
+        escrow.admin.require_auth();
+
+        // Validation: preventing post-funding tampering
+        assert!(escrow.status == 0, "Maturity can only be updated in Open state");
+
+        let old_maturity = escrow.maturity;
+        escrow.maturity = new_maturity;
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("escrow"), &escrow);
+
+        // Audit event
+        env.events().publish(
+            (symbol_short!("maturity"), symbol_short!("updated")),
+            (escrow.invoice_id.clone(), old_maturity, new_maturity),
+        );
+
         escrow
     }
 }

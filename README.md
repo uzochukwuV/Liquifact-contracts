@@ -65,10 +65,11 @@ liquifact-contracts/
 
 ### Escrow contract (high level)
 
-- **init** — Create an invoice escrow (invoice id, SME address, amount, yield bps, maturity).
+- **init** — Create an invoice escrow (invoice id, SME address, admin address, amount, yield bps, maturity).
 - **get_escrow** — Read current escrow state.
 - **fund** — Record investor funding; status becomes “funded” when target is met.
 - **settle** — Mark escrow as settled (buyer paid; investors receive principal + yield).
+- **update_maturity** — Update maturity timestamp (authorized admin only, Open state only).
 
 ---
 
