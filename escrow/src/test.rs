@@ -22,6 +22,22 @@ fn default_init(client: &LiquifactEscrowClient, admin: &Address, sme: &Address) 
 
 // ── init ──────────────────────────────────────────────────────────────────────
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn deploy(env: &Env) -> (Address, LiquifactEscrowClient<'_>) {
+    let contract_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(env, &contract_id);
+    (contract_id, client)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// init
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// After `init` the escrow must be open (status 0) with zero funded_amount,
+/// and `get_escrow` must return an identical snapshot.
 #[test]
 fn test_init_sets_version() {
     let env = Env::default();
@@ -65,14 +81,23 @@ fn test_init_and_get_escrow() {
     assert_eq!(escrow.admin, admin);
     assert_eq!(escrow.sme_address, sme);
     assert_eq!(escrow.amount, 10_000_0000000i128);
+    assert_eq!(escrow.funding_target, 10_000_0000000i128);
     assert_eq!(escrow.funded_amount, 0);
+    assert_eq!(escrow.yield_bps, 800);
+    assert_eq!(escrow.maturity, 1000);
     assert_eq!(escrow.status, 0);
 
+    // get_escrow must match what init returned
     let got = client.get_escrow();
     assert_eq!(got.invoice_id, escrow.invoice_id);
     assert_eq!(got.admin, admin);
 }
 
+/// `init` must emit exactly one `EscrowInitialized` event whose payload
+/// matches the returned snapshot.
+///
+/// `env.events().all()` captures events from the last invocation only — this
+/// works perfectly since init is the only call in this test.
 #[test]
 #[should_panic(expected = "Escrow already initialized")]
 fn test_reinit_is_rejected() {
@@ -498,11 +523,31 @@ fn test_partial_settlement_flow() {
     let env = Env::default();
     env.mock_all_auths();
 
+    let expected_event = EscrowInitialized {
+        name: symbol_short!("escrow_ii"),
+        escrow: escrow.clone(),
+    };
+
+    assert_eq!(
+        env.events().all(),
+        std::vec![expected_event.to_xdr(&env, &contract_id)],
+        "EscrowInitialized event must match the returned InvoiceEscrow snapshot"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// fund
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Partial funding keeps status at 0; full funding flips status to 1.
+#[test]
+fn test_partial_then_full_fund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = deploy(&env);
     let sme = Address::generate(&env);
     let admin = Address::generate(&env);
     let investor = Address::generate(&env);
-    let contract_id = env.register(LiquifactEscrow, ());
-    let client = LiquifactEscrowClient::new(&env, &contract_id);
 
     client.init(
         &symbol_short!("INV_P1"),

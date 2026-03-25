@@ -1,4 +1,4 @@
-//! LiquiFact Escrow Contract
+//! # LiquiFact Escrow Contract
 //!
 //! Holds investor funds for an invoice until settlement.
 //! - SME receives stablecoin when funding target is met
@@ -26,10 +26,15 @@ use soroban_sdk::{
 /// Current storage schema version. Bump this with every breaking struct change.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Full state of an invoice escrow persisted in contract storage.
+///
+/// All monetary values use the smallest indivisible unit of the relevant
+/// Stellar asset (e.g. stroops for XLM, or the token's own precision).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvoiceEscrow {
-    /// Unique invoice identifier (e.g. INV-1023)
+    /// Unique invoice identifier agreed between SME and platform (e.g. `"INV1023"`).
+    /// Maximum 8 ASCII characters due to Soroban `symbol_short!` constraints.
     pub invoice_id: Symbol,
     /// Admin address that initialized this escrow
     pub admin: Address,
@@ -39,17 +44,27 @@ pub struct InvoiceEscrow {
     pub admin: Address,
     /// Total amount in smallest unit (e.g. stroops for XLM)
     pub amount: i128,
-    /// Funding target must be met to release to SME
+
+    /// Investor funding target.  Currently equal to `amount`; may diverge
+    /// in future versions that support partial invoice tokenization.
     pub funding_target: i128,
-    /// Total funded so far by investors
+
+    /// Running total committed by investors so far (starts at 0).
+    /// Status transitions to `1` (funded) the moment this reaches `funding_target`.
     pub funded_amount: i128,
     /// Total settled (paid by buyer) so far
     pub settled_amount: i128,
     /// Yield basis points (e.g. 800 = 8%)
     pub yield_bps: i64,
-    /// Maturity timestamp (ledger time)
+
+    /// Ledger timestamp at which the invoice matures and settlement is expected.
+    /// Stored as seconds since Unix epoch (Soroban `u64` ledger time).
     pub maturity: u64,
-    /// Escrow status: 0 = open, 1 = funded, 2 = settled
+
+    /// Escrow lifecycle status:
+    /// - `0` — **open**: accepting investor funding
+    /// - `1` — **funded**: target met; SME can be paid; awaiting buyer settlement
+    /// - `2` — **settled**: buyer paid; investors can redeem principal + yield
     pub status: u32,
     /// Storage schema version — must equal [`SCHEMA_VERSION`] after any migration
     pub version: u32,
@@ -71,6 +86,120 @@ pub struct PartialSettlementEvent {
     pub settled_amount: i128,
     pub total_due: i128,
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Event types (one per state-changing function)
+//
+// Fields annotated with `#[topic]` appear in the Soroban event topic vector;
+// all other fields appear in the event data payload.
+//
+// Keeping payloads as named structs makes XDR decoding forward-compatible and
+// self-documenting in ledger explorers.  See docs/EVENT_SCHEMA.md for the
+// full indexer reference including JSON examples and XDR topic filters.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Emitted by `init()` when a new invoice escrow is created.
+///
+/// ### Indexer example (JSON after XDR decode)
+/// ```json
+/// {
+///   "event"         : "escrow_initd",
+///   "invoice_id"    : "INV1023",
+///   "sme_address"   : "GBSME...",
+///   "amount"        : 100000000000,
+///   "funding_target": 100000000000,
+///   "funded_amount" : 0,
+///   "yield_bps"     : 800,
+///   "maturity"      : 1750000000,
+///   "status"        : 0
+/// }
+/// ```
+#[contractevent]
+pub struct EscrowInitialized {
+    /// Event name topic — used by indexers to filter this event type.
+    #[topic]
+    pub name: Symbol,
+    /// Full escrow snapshot at creation time (status always 0 / open).
+    pub escrow: InvoiceEscrow,
+}
+
+/// Emitted by `fund()` on every successful investor contribution.
+///
+/// Emitted on **every** `fund()` call, not only when the target is first met.
+/// Indexers can sum `amount` per `invoice_id` to reconstruct the full funding
+/// history without reading contract storage.
+///
+/// ### Indexer example (JSON after XDR decode)
+/// ```json
+/// {
+///   "event"        : "escrow_funded",
+///   "invoice_id"   : "INV1023",
+///   "investor"     : "GBINV...",
+///   "amount"       : 50000000000,
+///   "funded_amount": 100000000000,
+///   "status"       : 1
+/// }
+/// ```
+#[contractevent]
+pub struct EscrowFunded {
+    /// Event name topic.
+    #[topic]
+    pub name: Symbol,
+    /// Invoice this contribution belongs to.
+    pub invoice_id: Symbol,
+    /// Investor wallet that called `fund()`.
+    pub investor: Address,
+    /// Amount added in this single call (always positive).
+    pub amount: i128,
+    /// Cumulative funded amount **after** this call.
+    pub funded_amount: i128,
+    /// Status value **after** this call: `0` = still open, `1` = now fully funded.
+    pub status: u32,
+}
+
+/// Emitted by `settle()` once the buyer has paid and the escrow is closed.
+///
+/// Contains everything needed for a settlement accounting service to compute
+/// investor payouts without re-reading contract storage.
+///
+/// ### Indexer example (JSON after XDR decode)
+/// ```json
+/// {
+///   "event"         : "escrow_settled",
+///   "invoice_id"    : "INV1023",
+///   "funded_amount" : 100000000000,
+///   "yield_bps"     : 800,
+///   "maturity"      : 1750000000
+/// }
+/// ```
+///
+/// ### Payout formula (off-chain, backend responsibility)
+/// ```text
+/// gross_yield = funded_amount * (yield_bps / 10_000) * (days_held / 365)
+/// investor_payout = funded_amount + gross_yield
+/// ```
+#[contractevent]
+pub struct EscrowSettled {
+    /// Event name topic.
+    #[topic]
+    pub name: Symbol,
+    /// Invoice that has been settled.
+    pub invoice_id: Symbol,
+    /// Total principal held (== `funding_target` at settlement time).
+    pub funded_amount: i128,
+    /// Annualized yield in basis points for investor payout calculation.
+    pub yield_bps: i64,
+    /// Original maturity timestamp — used by backend to compute accrued interest.
+    pub maturity: u64,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Contract
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Storage key for the single `InvoiceEscrow` record kept in instance storage.
+/// One contract instance == one invoice escrow.
+const ESCROW_KEY: Symbol = symbol_short!("escrow");
 
 #[contract]
 pub struct LiquifactEscrow;
@@ -123,11 +252,20 @@ impl LiquifactEscrow {
         escrow
     }
 
-    /// Get current escrow state.
+    // ──────────────────────────────────────────────────────────────────────────
+    // get_escrow
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Return the current escrow state without modifying storage.
+    ///
+    /// Read-only; does **not** emit an event.
+    ///
+    /// ## Errors
+    /// Panics with `"Escrow not initialized"` if `init` has not been called.
     pub fn get_escrow(env: Env) -> InvoiceEscrow {
         env.storage()
             .instance()
-            .get(&symbol_short!("escrow"))
+            .get(&ESCROW_KEY)
             .unwrap_or_else(|| panic!("Escrow not initialized"))
     }
 
@@ -198,13 +336,27 @@ impl LiquifactEscrow {
 
         let mut escrow = Self::get_escrow(env.clone());
         assert!(escrow.status == 0, "Escrow not open for funding");
+
         escrow.funded_amount += amount;
         if escrow.funded_amount >= escrow.funding_target {
-            escrow.status = 1; // funded - ready to release to SME
+            escrow.status = 1; // funded — ready to release to SME
         }
-        env.storage()
-            .instance()
-            .set(&symbol_short!("escrow"), &escrow);
+
+        env.storage().instance().set(&ESCROW_KEY, &escrow);
+
+        // Event: EscrowFunded
+        // Emitted on every successful fund() call. Indexers can also detect
+        // the "fully funded" milestone via status == 1 in this payload.
+        EscrowFunded {
+            name: symbol_short!("escrow_fd"),
+            invoice_id: escrow.invoice_id.clone(),
+            investor,
+            amount,
+            funded_amount: escrow.funded_amount,
+            status: escrow.status,
+        }
+        .publish(&env);
+
         escrow
     }
 

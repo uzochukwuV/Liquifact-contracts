@@ -53,9 +53,11 @@ For CI and local checks you only need Rust and `cargo`.
 
 ```text
 liquifact-contracts/
-├── Cargo.toml           # Workspace definition
+├── Cargo.toml              # Workspace definition
+├── docs/
+│   └── EVENT_SCHEMA.md    # Indexer-friendly event schema reference
 ├── escrow/
-│   ├── Cargo.toml       # Escrow contract crate
+│   ├── Cargo.toml          # Escrow contract crate
 │   └── src/
 │       ├── lib.rs       # LiquiFact escrow contract (init, fund, settle, migrate)
 │       └── test.rs      # Unit tests
@@ -65,7 +67,7 @@ liquifact-contracts/
 │   └── tests/
 │       └── openapi.test.js  # Schema conformance tests (51 cases)
 └── .github/workflows/
-    └── ci.yml           # CI: fmt, build, test
+    └── ci.yml              # CI: fmt, build, test
 ```
 
 ### Escrow contract (high level)
