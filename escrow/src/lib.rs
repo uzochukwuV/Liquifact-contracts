@@ -15,7 +15,7 @@
 //! All auth checks are enforced via [`Address::require_auth`], which integrates
 //! with Soroban's native authorization framework and is verifiable on-chain.
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,6 +144,155 @@ impl LiquifactEscrow {
             .instance()
             .set(&symbol_short!("escrow"), &escrow);
         escrow
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Escrow Factory
+// ---------------------------------------------------------------------------
+
+/// Storage keys used by [`EscrowFactory`].
+///
+/// - `Escrow(invoice_id)` — persistent per-invoice escrow record.
+/// - `Registry`           — ordered list of all registered invoice IDs.
+#[contracttype]
+pub enum FactoryKey {
+    Escrow(Symbol),
+    Registry,
+}
+
+/// Factory contract that registers and manages one [`InvoiceEscrow`] per invoice.
+///
+/// # Design
+/// Each invoice gets its own isolated escrow record stored under a
+/// [`FactoryKey::Escrow`] key in persistent storage.  A [`FactoryKey::Registry`]
+/// entry tracks the ordered list of all invoice IDs so callers can enumerate
+/// them without off-chain indexing.
+///
+/// # Authorization boundaries
+///
+/// | Function        | Required signer | Reason                                   |
+/// |-----------------|-----------------|------------------------------------------|
+/// | `create_escrow` | `admin`         | Only admin may open a new escrow          |
+/// | `fund`          | `investor`      | Investor authorizes their own contribution|
+/// | `settle`        | `sme_address`   | Only the SME beneficiary may settle       |
+#[contract]
+pub struct EscrowFactory;
+
+#[contractimpl]
+impl EscrowFactory {
+    /// Register a new per-invoice escrow.
+    ///
+    /// Panics if an escrow for `invoice_id` already exists.
+    pub fn create_escrow(
+        env: Env,
+        admin: Address,
+        invoice_id: Symbol,
+        sme_address: Address,
+        amount: i128,
+        yield_bps: i64,
+        maturity: u64,
+    ) -> InvoiceEscrow {
+        admin.require_auth();
+
+        assert!(
+            !env.storage()
+                .persistent()
+                .has(&FactoryKey::Escrow(invoice_id.clone())),
+            "Escrow already exists for this invoice"
+        );
+
+        let escrow = InvoiceEscrow {
+            invoice_id: invoice_id.clone(),
+            admin: admin.clone(),
+            sme_address,
+            amount,
+            funding_target: amount,
+            funded_amount: 0,
+            yield_bps,
+            maturity,
+            status: 0,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&FactoryKey::Escrow(invoice_id.clone()), &escrow);
+
+        let mut registry: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&FactoryKey::Registry)
+            .unwrap_or_else(|| Vec::new(&env));
+        registry.push_back(invoice_id);
+        env.storage()
+            .persistent()
+            .set(&FactoryKey::Registry, &registry);
+
+        escrow
+    }
+
+    /// Look up the escrow for a specific invoice.
+    ///
+    /// Panics if no escrow has been registered for `invoice_id`.
+    pub fn get_escrow(env: Env, invoice_id: Symbol) -> InvoiceEscrow {
+        env.storage()
+            .persistent()
+            .get(&FactoryKey::Escrow(invoice_id))
+            .unwrap_or_else(|| panic!("Escrow not found for invoice"))
+    }
+
+    /// Record an investor funding contribution for a specific invoice.
+    ///
+    /// Status flips to `1` (funded) once `funded_amount >= funding_target`.
+    /// Panics if the escrow is not in the open (`status = 0`) state.
+    pub fn fund(
+        env: Env,
+        invoice_id: Symbol,
+        investor: Address,
+        amount: i128,
+    ) -> InvoiceEscrow {
+        investor.require_auth();
+
+        let mut escrow = Self::get_escrow(env.clone(), invoice_id.clone());
+        assert!(escrow.status == 0, "Escrow not open for funding");
+
+        escrow.funded_amount += amount;
+        if escrow.funded_amount >= escrow.funding_target {
+            escrow.status = 1;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&FactoryKey::Escrow(invoice_id), &escrow);
+        escrow
+    }
+
+    /// Mark a funded escrow as settled.
+    ///
+    /// Requires authorization from the `sme_address` stored in the escrow.
+    /// Panics if the escrow is not in the funded (`status = 1`) state.
+    pub fn settle(env: Env, invoice_id: Symbol) -> InvoiceEscrow {
+        let mut escrow = Self::get_escrow(env.clone(), invoice_id.clone());
+        escrow.sme_address.require_auth();
+
+        assert!(
+            escrow.status == 1,
+            "Escrow must be funded before settlement"
+        );
+        escrow.status = 2;
+
+        env.storage()
+            .persistent()
+            .set(&FactoryKey::Escrow(invoice_id), &escrow);
+        escrow
+    }
+
+    /// Return all registered invoice IDs in creation order.
+    pub fn list_invoices(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .persistent()
+            .get(&FactoryKey::Registry)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
 

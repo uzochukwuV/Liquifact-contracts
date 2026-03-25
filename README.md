@@ -95,6 +95,45 @@ All sensitive state transitions are protected by Soroban's native [`require_auth
 
 ---
 
+## Escrow Factory pattern
+
+The `EscrowFactory` contract (also in `escrow/src/lib.rs`) implements a **per-invoice factory** that registers and manages one isolated escrow record per invoice, removing the single-escrow-per-deployment limitation of the base `LiquifactEscrow` contract.
+
+### Why a factory?
+
+| Concern                  | `LiquifactEscrow` (single)        | `EscrowFactory` (factory)                  |
+|--------------------------|-----------------------------------|--------------------------------------------|
+| Escrows per contract     | 1                                 | Unlimited (one per invoice ID)             |
+| State isolation          | Contract-level                    | Per-invoice, keyed by `Symbol`             |
+| Enumeration              | Not supported                     | `list_invoices()` returns all IDs          |
+| Operational overhead     | Deploy one contract per invoice   | Deploy once, register many invoices        |
+
+### Factory entry points
+
+| Function         | Auth required  | Description                                               |
+|------------------|----------------|-----------------------------------------------------------|
+| `create_escrow`  | `admin`        | Register a new per-invoice escrow; panics if ID exists    |
+| `get_escrow`     | —              | Look up escrow state by invoice ID                        |
+| `fund`           | `investor`     | Record investor contribution; flips status when target met|
+| `settle`         | `sme_address`  | Mark a funded escrow as settled                           |
+| `list_invoices`  | —              | Return all registered invoice IDs in creation order       |
+
+### Storage layout
+
+```
+FactoryKey::Escrow(invoice_id)  →  InvoiceEscrow   (persistent, per-invoice)
+FactoryKey::Registry            →  Vec<Symbol>     (persistent, ordered invoice list)
+```
+
+### Security assumptions
+
+- `admin` is trusted to register legitimate invoices. Use a multisig address in production.
+- Duplicate registration for the same `invoice_id` is blocked at the contract level.
+- `settle` can only move status `1 → 2`; calling it on any other state panics.
+- Funding one invoice never touches another invoice's storage slot.
+
+---
+
 ## API documentation (OpenAPI)
 
 The REST API surface is documented in [`docs/openapi.yaml`](docs/openapi.yaml) (OpenAPI 3.1).
