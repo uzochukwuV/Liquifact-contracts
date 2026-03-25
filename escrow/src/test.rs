@@ -222,6 +222,7 @@ fn test_init_and_get_escrow() {
     assert_eq!(escrow.invoice_id, symbol_short!("INV001"));
     assert_eq!(escrow.admin, admin);
     assert_eq!(escrow.sme_address, sme);
+    assert_eq!(escrow.buyer_address, buyer);
     assert_eq!(escrow.amount, 10_000_0000000i128);
     assert_eq!(escrow.funding_target, 10_000_0000000i128);
     assert_eq!(escrow.funded_amount, 0);
@@ -308,6 +309,7 @@ fn test_partial_fund_stays_open() {
         &admin,
         &symbol_short!("INV003"),
         &sme,
+        &buyer,
         &10_000_0000000i128,
         &800i64,
         &1000u64,
@@ -366,6 +368,7 @@ fn test_fund_records_investor_auth() {
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let sme = Address::generate(&env);
+    let buyer = Address::generate(&env);
     let investor = Address::generate(&env);
     let client = deploy(&env);
 
@@ -373,6 +376,7 @@ fn test_fund_records_investor_auth() {
         &admin,
         &symbol_short!("INV010"),
         &sme,
+        &buyer,
         &1_000i128,
         &500i64,
         &2000u64,
@@ -392,6 +396,7 @@ fn test_settle_records_sme_auth() {
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let sme = Address::generate(&env);
+    let buyer = Address::generate(&env);
     let investor = Address::generate(&env);
     let client = deploy(&env);
 
@@ -399,12 +404,14 @@ fn test_settle_records_sme_auth() {
         &admin,
         &symbol_short!("INV005"),
         &sme,
+        &buyer,
         &1_000i128,
         &500i64,
         &2000u64,
         &test_hash(&env),
     );
     client.fund(&investor, &1_000i128);
+    client.confirm_payment();
     client.settle();
 
     assert!(

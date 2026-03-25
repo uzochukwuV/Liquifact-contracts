@@ -1,8 +1,13 @@
 //! # LiquiFact Escrow Contract
 //!
 //! Holds investor funds for an invoice until settlement.
-//! - SME receives stablecoin when funding target is met
-//! - Investors receive principal + yield when buyer pays at maturity
+//!
+//! ### Settlement Sequence
+//! 1. **Initialization**: Admin creates the escrow with `init`.
+//! 2. **Funding**: Investors contribute funds via `fund` until `funding_target` is met (status 0 -> 1).
+//! 3. **Payment Confirmation**: After buyer pays the SME off-chain (or via other means), the buyer
+//!    calls `confirm_payment` to acknowledge repayment.
+//! 4. **Settlement**: SME calls `settle` to finalize the escrow, moving it to status 2.
 //!
 //! # Storage Schema Versioning
 //!
@@ -155,6 +160,8 @@ pub struct EscrowFunded {
     pub funded_amount: i128,
     /// Status value **after** this call: `0` = still open, `1` = now fully funded.
     pub status: u32,
+    /// Whether the buyer has confirmed payment (repayment of invoice)
+    pub is_paid: bool,
 }
 
 /// Emitted by `settle()` once the buyer has paid and the escrow is closed.
@@ -384,6 +391,11 @@ impl LiquifactEscrow {
         assert!(escrow.status == 1, "Escrow must be funded");
     /// Mark escrow as settled (buyer paid). Releases principal + yield to investors.
     ///
+    /// This is the final step in the escrow lifecycle. It requires that:
+    /// 1. The escrow is fully funded (status = 1).
+    /// 2. The buyer has explicitly confirmed payment via `confirm_payment`.
+    /// 3. The SME (payee) authorizes the settlement.
+    ///
     /// # Authorization
     /// Requires authorization from the `sme_address` stored in the escrow.
     /// Only the SME that is the beneficiary of the escrow may trigger settlement,
@@ -391,6 +403,7 @@ impl LiquifactEscrow {
     ///
     /// # Panics
     /// - If the escrow is not in the funded (status = 1) state.
+    /// - If the buyer has not confirmed the payment yet.
     pub fn settle(env: Env) -> InvoiceEscrow {
         let mut escrow = Self::get_escrow(env.clone());
 
