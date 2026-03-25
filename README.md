@@ -1,254 +1,191 @@
-# LiquiFact Escrow Contract – Threat Model & Security Notes
+# LiquiFact Escrow Contract
 
-Soroban smart contracts for **LiquiFact** — the global invoice liquidity network on Stellar.
-This repo contains the **escrow** contract that holds investor funds for tokenized invoices until settlement.
+Soroban smart contracts for **LiquiFact** on Stellar. This repository currently
+contains the `escrow` contract crate and its supporting documentation.
 
----
+## Storage Schema And Upgrade Compatibility
 
-## Threat Model
+This section is the canonical reviewer-facing description of escrow storage for
+Issue #21. It is anchored to the live source in `escrow/src/lib.rs`, but it does
+not silently normalize source drift. The documentation below distinguishes:
 
-### 1. Unauthorized Access
+- the raw storage inventory actually declared or referenced by source
+- the narrative schema view reviewers should rely on when evaluating upgrades
+- known divergences where code and documentation cannot yet be made perfectly clean
 
-**Risk:**
-- Anyone can call `fund` or `settle`
+### Canonical source basis
 
-**Impact:**
-- Malicious settlement
-- Fake funding events
+For this task, storage documentation is derived only from the live source in
+`escrow/src/lib.rs`:
 
-**Mitigation (Current):**
-- None (mock auth used in tests)
+- instance storage references currently use the literal keys `"escrow"` and `"version"`
+- the persisted escrow record is the `InvoiceEscrow` struct as declared in source
+- any API parameter or helper that is not written into storage is excluded from the
+  persisted schema narrative and called out separately as divergence
 
-**Recommended Controls:**
-- Require auth:
-  - `fund`: investor must authorize
-  - `settle`: only trusted role (e.g. admin/oracle)
+### Raw storage inventory
 
----
+#### Instance storage keys referenced by source
 
-### 2. Arithmetic Risks (Overflow / Underflow)
+| Key | Source usage | Stored value |
+|---|---|---|
+| `"escrow"` | `get_escrow`, `init`, `fund`, `settle`, `update_maturity`, `withdraw`, migration example | `InvoiceEscrow` |
+| `"version"` | `init`, `get_version`, `migrate` | `u32` schema version |
 
-**Risk:**
-- `funded_amount += amount` may overflow `i128`
+#### Persisted struct fields exactly as declared in `InvoiceEscrow`
 
----
+| Order | Field | Rust type | Raw source note |
+|---|---|---|---|
+| 1 | `invoice_id` | `Symbol` | Declared once |
+| 2 | `admin` | `Address` | First `admin` declaration |
+| 3 | `sme_address` | `Address` | Declared once |
+| 4 | `admin` | `Address` | Duplicate field name in source |
+| 5 | `amount` | `i128` | Declared once |
+| 6 | `funding_target` | `i128` | Declared once |
+| 7 | `funded_amount` | `i128` | Declared once |
+| 8 | `settled_amount` | `i128` | Declared once |
+| 9 | `yield_bps` | `i64` | Declared as `i64` in struct |
+| 10 | `maturity` | `u64` | Declared once |
+| 11 | `status` | `u32` | Declared once |
+| 12 | `version` | `u32` | Declared once |
 
-### 3. Replay / Double Execution
+### Narrative schema view
 
-```bash
-git clone <this-repo-url>
-cd liquifact-contracts
-cargo build
-cargo test
-```
+The contract is trying to persist a single escrow snapshot plus an explicit
+schema version:
 
----
+- `"escrow"` stores the full invoice escrow snapshot
+- `"version"` stores the current schema version independently for upgrade checks
 
-### 5. Invalid Input / Economic Attacks
+For reviewer guidance, the intended persisted escrow fields are:
 
-**Risks:**
-- Negative funding
-- Zero funding
-- Invalid maturity
+| Field | Intended meaning |
+|---|---|
+| `invoice_id` | Short invoice identifier used as part of the escrow record |
+| `admin` | Administrative address intended to control privileged maintenance actions |
+| `sme_address` | SME beneficiary address |
+| `amount` | Principal amount |
+| `funding_target` | Funding threshold, currently initialized from `amount` |
+| `funded_amount` | Running funded total |
+| `settled_amount` | Running settled total; source support exists but behavior is still inconsistent |
+| `yield_bps` | Yield in basis points |
+| `maturity` | Maturity timestamp |
+| `status` | Lifecycle state flag |
+| `version` | Persisted schema version, expected to track `SCHEMA_VERSION` |
 
-| Command                | Description                                                |
-|------------------------|------------------------------------------------------------|
-| `cargo build`          | Build all contracts                                        |
-| `cargo test`           | Run unit tests and property-based tests (using `proptest`) |
-| `cargo fmt`            | Format code                                                |
-| `cargo fmt -- --check` | Check formatting (used in CI)                              |
+### Status values
 
----
+The live source and comments currently imply these status codes:
 
-### 6. Time-based Attacks
+| Value | Meaning | Notes |
+|---|---|---|
+| `0` | Open | Funding allowed |
+| `1` | Funded | Funding target reached; additional flows diverge |
+| `2` | Settled | Mentioned in source comments and settlement logic |
+| `3` | Withdrawn | Used by `withdraw`, but not reflected consistently in top-level status docs |
 
-```text
-liquifact-contracts/
-├── Cargo.toml              # Workspace definition
-├── docs/
-│   └── EVENT_SCHEMA.md    # Indexer-friendly event schema reference
-├── escrow/
-│   ├── Cargo.toml          # Escrow contract crate
-│   └── src/
-│       ├── lib.rs       # LiquiFact escrow contract (init, fund, settle, migrate)
-│       └── test.rs      # Unit tests
-├── docs/
-│   ├── openapi.yaml     # OpenAPI 3.1 specification
-│   ├── package.json     # Test runner deps (AJV, js-yaml)
-│   └── tests/
-│       └── openapi.test.js  # Schema conformance tests (51 cases)
-└── .github/workflows/
-    └── ci.yml              # CI: fmt, build, test
-```
+### Versioning behavior
 
-Records an investor contribution. Transitions to `status = 1` when
-`funded_amount >= funding_target`.
+The source currently treats schema versioning as follows:
 
-> **Production note:** Must be called atomically with a SEP-41 token `transfer`
-> from `investor` to the contract address. This version records accounting only.
+- `SCHEMA_VERSION` is set to `1`
+- `init` writes `SCHEMA_VERSION` into both the escrow record's `version` field and the `"version"` instance key
+- `get_version()` reads `"version"` and falls back to `0` if absent
+- `migrate(from_version)` checks that the stored `"version"` matches the argument
+- `migrate(from_version)` rejects `from_version >= SCHEMA_VERSION`
+- no actual migration arm is implemented yet; current code ends in a panic path
 
-**Parameters**
+### Upgrade compatibility guidance
 
-| Parameter   | Constraints                                  |
-|-------------|----------------------------------------------|
-| `_investor` | Investor's Stellar address (for audit trail) |
-| `amount`    | > 0 recommended; partial funding is allowed  |
+Future upgrade work should preserve a strict distinction between additive
+behavior changes and storage-breaking schema changes.
 
-**Returns** — Updated `InvoiceEscrow`.
+#### Additive changes
 
-**Failure conditions**
+These are usually safe without rewriting existing bytes:
 
-| Condition                 | Behaviour                               |
-|---------------------------|-----------------------------------------|
-| `status != 0`             | Panics: `"Escrow not open for funding"` |
-| `init` not called         | Panics: `"Escrow not initialized"`      |
-| `funded_amount` overflows | Rust panics (debug) / wraps (release)   |
+- adding new methods that read existing storage without changing the stored layout
+- adding documentation-only clarifications
+- adding new events that describe state already present in storage
 
-**State transitions**
+#### Breaking schema changes
 
-- **init** — Create an invoice escrow (invoice id, SME address, admin address, amount, yield bps, maturity).
-- **get_escrow** — Read current escrow state.
-- **get_version** — Return the stored schema version number.
-- **fund** — Record investor funding; status becomes "funded" when target is met.
-- **settle** — Mark escrow as settled (buyer paid; investors receive principal + yield).
-- **migrate** — Upgrade storage from an older schema version to the current one (see below).
+These require a version bump and a migration strategy:
 
-### Edge-case test matrix (`escrow/src/test.rs`)
+- adding, removing, renaming, reordering, or retyping any persisted `InvoiceEscrow` field
+- changing the serialization shape of the `"escrow"` value
+- changing the meaning or type of the `"version"` key
 
-Tests are tagged by risk category in inline comments:
+#### Required migration discipline
 
-| Category  | Tag       | What is covered |
-|-----------|-----------|-----------------|
-| Happy path | `[HAPPY]` | Full lifecycle, field persistence, `get_escrow` consistency |
-| Auth       | `[AUTH]`  | `require_auth` recorded for admin / investor / SME; panics without auth |
-| State      | `[STATE]` | Double-init, fund-after-funded, fund-after-settled, settle-when-open, double-settle |
-| Uninitialized | `[UNINIT]` | `get_escrow`, `fund`, `settle` all panic before `init` |
-| Boundary   | `[BOUND]` | `amount=1`, `amount=i128::MAX`, `yield_bps=i64::MAX`, `maturity=0`, `maturity=u64::MAX`, overshoot funding, exact-boundary funding |
-| Repeated calls | `[REPEAT]` | Multiple investors accumulate correctly; `get_escrow` is idempotent |
+For any future schema bump:
 
----
+1. Bump `SCHEMA_VERSION`.
+2. Keep historical decoders available, typically as explicit legacy structs.
+3. Add a migration arm that reads the old layout and writes the new layout.
+4. Update both the `"escrow"` value and the `"version"` key atomically.
+5. Preserve old migration arms so historical deployments remain upgradable.
 
-## Contract migration strategy
+### Known schema and documentation divergences
 
-### Overview
+These source inconsistencies affect how the storage story must be documented
+today. They are called out explicitly instead of being papered over in prose.
 
-The escrow contract stores its state as a single [`InvoiceEscrow`](escrow/src/lib.rs) struct under the instance storage key `"escrow"`, alongside a `"version"` key that holds the current schema version (`u32`).
+| Source divergence | Documentation treatment | Why it matters for upgrades |
+|---|---|---|
+| Duplicate `admin` field in `InvoiceEscrow` | Treated as code drift, not as two meaningful persisted admin roles | Reviewers should not design migrations around a fictitious dual-admin schema |
+| `funding_deadline` parameter in `init` is not written into storage | Excluded from persisted schema narrative | API shape and storage shape are currently different |
+| `settled_amount` exists in the struct but surrounding settlement flow is inconsistent | Documented as persisted with unstable behavioral support | A future migration must preserve the field even if semantics are tightened |
+| `yield_bps` is `i64` in `InvoiceEscrow` but `u32` in `init` | Documented as a source/interface mismatch | Retyping one side later is a breaking compatibility concern |
+| `DataKey::Escrow` is referenced in `init` but no `DataKey` enum is defined | Storage docs use the actual live keys `"escrow"` and `"version"` | Reviewers should anchor upgrades to real storage references, not undefined helper machinery |
 
-Any change to the struct layout (adding, removing, or retyping a field) is a **breaking schema change** and requires a version bump and a migration path.
+### Rustdoc rendering limitation
 
-### Version history
+The rustdoc clarifications added to `escrow/src/lib.rs` are source-accurate, but
+they are not currently renderable in generated documentation because the crate
+does not compile. In particular, the duplicate `admin` field declaration in
+`InvoiceEscrow` blocks successful compilation. That duplicate should be removed
+in a separate fix PR; this documentation PR does not change contract behavior or
+repair compile-time source drift.
 
-| Version | Description |
-|---------|-------------|
-| 1       | Initial schema — `invoice_id`, `sme_address`, `amount`, `funding_target`, `funded_amount`, `yield_bps`, `maturity`, `status`, `version` |
+### Test-state notes for this documentation task
 
-### How versioning works
+`escrow/src/test.rs` currently mixes live escrow expectations with obvious branch
+drift from unrelated work. For documentation purposes:
 
-- `SCHEMA_VERSION` in `lib.rs` is the source of truth for the current schema.
-- Every `init` call writes `SCHEMA_VERSION` into both the struct's `version` field and the `"version"` storage key.
-- `get_version()` lets off-chain tooling (indexers, upgrade scripts) read the stored version before deciding whether to call `migrate`.
+- the file still confirms that storage assumptions in the repo are unstable
+- it is not safe to treat the full test suite as an authoritative schema spec
+- the schema narrative in this README is therefore anchored to `lib.rs`, with
+  divergences surfaced explicitly
+- the crate does not currently compile, and that pre-existing failure is
+  independent of these documentation edits
 
-### Adding a new schema version (step-by-step)
+### Security and upgrade notes
 
-1. **Bump `SCHEMA_VERSION`** in `lib.rs` (e.g. `1` to `2`).
-2. **Keep the old struct** — add a `legacy` module (or a type alias like `InvoiceEscrowV1`) so the old bytes can still be deserialized.
-3. **Add a migration arm** in `LiquifactEscrow::migrate`:
-   ```rust
-   if from_version == 1 {
-       let old: InvoiceEscrowV1 = env.storage().instance()
-           .get(&symbol_short!("escrow")).unwrap();
-       let new = InvoiceEscrow {
-           // spread old fields, default new ones
-           new_field: default_value,
-           version: 2,
-           ..old.into()
-       };
-       env.storage().instance().set(&symbol_short!("escrow"), &new);
-       env.storage().instance().set(&symbol_short!("version"), &2u32);
-   }
-   ```
-4. **Write a test** in `test.rs` that manually writes the old struct bytes into storage and asserts the migrated state is correct.
-5. **Gate `migrate` behind admin auth** before deploying to production (see security notes below).
+- Re-initialization protection is intended, but the current guard references undefined helper machinery.
+- Upgrade paths should be admin-gated before production deployment.
+- Migration code must never silently drop or reinterpret historical fields.
+- Reviewers should treat source drift as a signal to preserve backward decoders and add focused migration tests before any schema evolution lands.
 
-### Deployment upgrade flow
+## Validation Commands
 
-```
-1. Deploy new WASM (bump SCHEMA_VERSION, add migration arm)
-2. Call get_version()  ->  confirm stored version == N
-3. Call migrate(N)     ->  storage upgraded to N+1
-4. Call get_version()  ->  confirm stored version == N+1
-5. Resume normal operations
-```
-
-The contract rejects `migrate` calls that:
-- Pass a `from_version` that does not match the stored version (prevents accidental double-migration).
-- Pass a `from_version >= SCHEMA_VERSION` (already up to date).
-
-### Security notes
-
-- **Re-initialization guard** — `init` panics if the escrow is already initialized, preventing state overwrite.
-- **`migrate` must be admin-gated in production** — the current implementation is open for testability. Before mainnet deployment, add `admin_address.require_auth()` at the top of `migrate` so only the contract deployer can trigger upgrades.
-- **No silent data loss** — migration arms must explicitly handle every field. Defaulting a field to zero/false is intentional and must be documented in the version history table above.
-- **Immutable history** — old migration arms should never be removed; they ensure any instance at any historical version can be brought forward step-by-step.
-
----
-
-## Security & Authorization
-
-Currently, the contract methods (`init`, `fund`, `settle`) **do not enforce authorization** via `require_auth()`. They rely solely on state-machine guards (e.g. checking if `status == 0` before funding).
-
-> **Warning:** This represents an authentication gap. Any caller can trigger these functions. Negative tests have been added to track this gap and ensure proper exceptions are thrown when the contract is in an invalid state.
-
----
-
-
-## Funding Constraints
-- **Minimum Funding:** All funding amounts must be strictly greater than zero ($> 0$). 
-- **Initialization:** Escrow creation will fail if the target amount is not positive.
-- **Integer Safety:** Uses `checked_add` to prevent overflow during funded amount accounting.
-
----
-
-## Security Assumptions
-
-- Soroban runtime guarantees:
-- Deterministic execution
-- Storage integrity
-- Token transfers handled externally
-- Off-chain systems validate invoice authenticity
-
----
-
----
-
-## Invariants
-
-- `funded_amount <= funding_target` (soft enforced)
-- `status transitions`: 0 → 1 → 2
-- Cannot settle before funded
-| Step | Command | Fails if… |
-|------|---------|-----------|
+| Step | Command | Fails if... |
+|---|---|---|
 | Format | `cargo fmt --all -- --check` | any file is not formatted |
 | Build | `cargo build` | compilation error |
 | Tests | `cargo test` | any test fails |
-| Coverage | `cargo llvm-cov --features testutils --fail-under-lines 95` | line coverage < 95 % |
+| Coverage | `cargo llvm-cov --features testutils --fail-under-lines 95` | line coverage < 95% |
 
 ### Coverage gate
 
-The pipeline uses [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) (installed via `taiki-e/install-action`) to measure line coverage and hard-fail the job when it drops below **95 %**.
-
-To run the coverage check locally:
+The pipeline uses [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov)
+to measure line coverage and fail when it drops below **95%**.
 
 ```bash
-# Install once
 cargo install cargo-llvm-cov
-
-# Run (requires llvm-tools-preview component)
 rustup component add llvm-tools-preview
 cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only
 ```
-
-Keep formatting, tests, and coverage passing before opening a PR.
 
 ---
 

@@ -1,28 +1,30 @@
 //! # LiquiFact Escrow Contract
 //!
-//! Holds investor funds for an invoice until settlement.
+//! This module documents the escrow contract's intended persisted storage shape
+//! as derived from the live source, while explicitly calling out source drift
+//! that affects upgrade safety review.
 //!
-//! ### Settlement Sequence
-//! 1. **Initialization**: Admin creates the escrow with `init`.
-//! 2. **Funding**: Investors contribute funds via `fund` until `funding_target` is met (status 0 -> 1).
-//! 3. **Payment Confirmation**: After buyer pays the SME off-chain (or via other means), the buyer
-//!    calls `confirm_payment` to acknowledge repayment.
-//! 4. **Settlement**: SME calls `settle` to finalize the escrow, moving it to status 2.
+//! ## Canonical storage references
 //!
-//! # Storage Schema Versioning
+//! The current source references two instance-storage entries:
+//! - `"escrow"` — the persisted [`InvoiceEscrow`] snapshot
+//! - `"version"` — a `u32` schema version marker
 //!
-//! The escrow state is stored under two keys:
-//! - `"escrow"` — the [`InvoiceEscrow`] struct (current schema)
-//! - `"version"` — a `u32` schema version number
+//! These literal keys are the only stable basis for storage documentation in
+//! the current branch. Helper-like references that do not resolve in source
+//! should be treated as code drift, not as authoritative schema machinery.
 //!
-//! ## Version history
+//! ## Upgrade compatibility notes
 //!
-//! | Version | Changes |
-//! |---------|---------|
-//! | 1       | Initial schema: invoice_id, sme_address, amount, funding_target, funded_amount, yield_bps, maturity, status |
+//! Any change to the serialized layout of [`InvoiceEscrow`] or the meaning/type
+//! of `"version"` is a storage-breaking change. Future upgrades should:
+//! - bump [`SCHEMA_VERSION`]
+//! - preserve historical decoders for old layouts
+//! - add explicit migration arms
+//! - update both `"escrow"` and `"version"` atomically
 //!
-//! When a new field is added or the struct layout changes, bump `SCHEMA_VERSION`,
-//! add a migration arm in [`LiquifactEscrow::migrate`], and add a corresponding test.
+//! This rustdoc intentionally avoids documenting unstable flows or non-persisted
+//! parameters as if they were part of the persisted schema.
 
 use soroban_sdk::{
     contract, contractevent, contractimpl, contracttype, symbol_short, vec, Address, Env, Symbol,
@@ -31,21 +33,34 @@ use soroban_sdk::{
 /// Current storage schema version. Bump this with every breaking struct change.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Full state of an invoice escrow persisted in contract storage.
+/// Full state of an invoice escrow persisted in instance storage.
 ///
 /// All monetary values use the smallest indivisible unit of the relevant
 /// Stellar asset (e.g. stroops for XLM, or the token's own precision).
+///
+/// Storage-review note: this struct is the raw schema inventory from source,
+/// including declarations that currently reflect branch drift. Reviewer-facing
+/// docs in `README.md` separate the raw declaration list from the cleaned
+/// narrative schema view used for upgrade guidance.
+///
+/// Rustdoc-rendering note: this commentary is currently not renderable through
+/// generated docs because the crate does not compile in its present state. The
+/// duplicate `admin` declaration below is one of the pre-existing blockers and
+/// should be resolved in a separate source-fix PR.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvoiceEscrow {
     /// Unique invoice identifier agreed between SME and platform (e.g. `"INV1023"`).
     /// Maximum 8 ASCII characters due to Soroban `symbol_short!` constraints.
     pub invoice_id: Symbol,
-    /// Admin address that initialized this escrow
+    /// Administrative address written into the persisted escrow snapshot.
     pub admin: Address,
     /// SME wallet that receives liquidity and authorizes settlement
     pub sme_address: Address,
-    /// Administrator authorized to update maturity
+    /// Duplicate `admin` declaration currently present in source.
+    ///
+    /// This should be treated as a source inconsistency for documentation and
+    /// upgrade review, not as proof of a second meaningful admin role.
     pub admin: Address,
     /// Total amount in smallest unit (e.g. stroops for XLM)
     pub amount: i128,
@@ -57,19 +72,30 @@ pub struct InvoiceEscrow {
     /// Running total committed by investors so far (starts at 0).
     /// Status transitions to `1` (funded) the moment this reaches `funding_target`.
     pub funded_amount: i128,
-    /// Total settled (paid by buyer) so far
+    /// Total settled (paid by buyer) so far.
+    ///
+    /// The field is part of the raw persisted schema inventory, but surrounding
+    /// settlement behavior is currently inconsistent and should be reviewed
+    /// cautiously in any future migration.
     pub settled_amount: i128,
-    /// Yield basis points (e.g. 800 = 8%)
+    /// Yield basis points (e.g. 800 = 8%).
+    ///
+    /// Source drift note: the struct stores this as `i64`, while `init`
+    /// currently accepts `u32`.
     pub yield_bps: i64,
 
     /// Ledger timestamp at which the invoice matures and settlement is expected.
     /// Stored as seconds since Unix epoch (Soroban `u64` ledger time).
     pub maturity: u64,
 
-    /// Escrow lifecycle status:
-    /// - `0` — **open**: accepting investor funding
-    /// - `1` — **funded**: target met; SME can be paid; awaiting buyer settlement
-    /// - `2` — **settled**: buyer paid; investors can redeem principal + yield
+    /// Escrow lifecycle status as implied by current source comments and logic.
+    ///
+    /// Current meanings are inconsistent across the module, but the code and
+    /// docs presently indicate:
+    /// - `0` — open
+    /// - `1` — funded
+    /// - `2` — settled
+    /// - `3` — withdrawn (explicitly written by `withdraw`)
     pub status: u32,
     /// Storage schema version — must equal [`SCHEMA_VERSION`] after any migration
     pub version: u32,
@@ -205,7 +231,9 @@ pub struct EscrowSettled {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Storage key for the single `InvoiceEscrow` record kept in instance storage.
-/// One contract instance == one invoice escrow.
+///
+/// The literal symbol `"escrow"` is part of the storage schema contract and is
+/// more authoritative than unresolved helper references elsewhere in the file.
 const ESCROW_KEY: Symbol = symbol_short!("escrow");
 
 #[contract]
@@ -219,10 +247,10 @@ impl LiquifactEscrow {
 
     /// Initialize a new invoice escrow.
     ///
-    /// `metadata_hash` must be the SHA-256 digest of the canonical off-chain invoice
-    /// document (e.g. `SHA-256(invoice_json_utf8_bytes)`). It is stored immutably
-    /// and can later be used by any party to verify that the document has not been
-    /// tampered with since escrow creation.
+    /// Persisted writes currently target the `"escrow"` and `"version"` instance
+    /// keys only. Parameters that are accepted by the signature but not written
+    /// into the persisted record should not be treated as part of the storage
+    /// schema without additional source changes.
     ///
     /// # Authorization
     /// Requires authorization from `admin`. This prevents any unauthorized
@@ -341,6 +369,8 @@ impl LiquifactEscrow {
     }
 
     /// Record investor funding. In production, this would be called with token transfer.
+    ///
+    /// Storage effect: rewrites the persisted `"escrow"` snapshot only.
     pub fn fund(env: Env, investor: Address, amount: i128) -> InvoiceEscrow {
     ///
     /// # Authorization
@@ -390,6 +420,8 @@ impl LiquifactEscrow {
 
         assert!(escrow.status == 1, "Escrow must be funded");
     /// Mark escrow as settled (buyer paid). Releases principal + yield to investors.
+    ///
+    /// Storage effect: rewrites the persisted `"escrow"` snapshot only.
     ///
     /// This is the final step in the escrow lifecycle. It requires that:
     /// 1. The escrow is fully funded (status = 1).
@@ -452,6 +484,8 @@ impl LiquifactEscrow {
     }
 
     /// Update maturity timestamp. Only allowed by admin in Open state.
+    ///
+    /// Storage effect: rewrites the persisted `"escrow"` snapshot only.
     pub fn update_maturity(env: Env, new_maturity: u64) -> InvoiceEscrow {
         let mut escrow = Self::get_escrow(env.clone());
 
@@ -499,6 +533,8 @@ impl LiquifactEscrow {
     ///
     /// # Returns
     /// The funded amount that was withdrawn to the SME.
+    ///
+    /// Storage effect: rewrites the persisted `"escrow"` snapshot only.
     ///
     /// # Example
     /// ```ignore
