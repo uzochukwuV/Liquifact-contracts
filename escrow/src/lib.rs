@@ -227,6 +227,7 @@ impl LiquifactEscrow {
         amount: i128,
         yield_bps: i64,
         maturity: u64,
+        funding_deadline: u64, // NEW
     ) -> InvoiceEscrow {
         // Prevent re-initialization
         assert!(
@@ -328,6 +329,7 @@ impl LiquifactEscrow {
     }
 
     /// Record investor funding. In production, this would be called with token transfer.
+    pub fn fund(env: Env, investor: Address, amount: i128) -> InvoiceEscrow {
     ///
     /// # Authorization
     /// Requires authorization from `investor`. Each investor authorizes their
@@ -368,6 +370,13 @@ impl LiquifactEscrow {
         escrow
     }
 
+    pub fn settle(env: Env) -> InvoiceEscrow {
+        let mut escrow = Self::get_escrow(env.clone());
+
+        // check expiry
+        Self::check_and_update_expiry(&env, &mut escrow);
+
+        assert!(escrow.status == 1, "Escrow must be funded");
     /// Mark escrow as settled (buyer paid). Releases principal + yield to investors.
     ///
     /// # Authorization

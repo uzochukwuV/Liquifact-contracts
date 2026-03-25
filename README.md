@@ -206,6 +206,13 @@ Currently, the contract methods (`init`, `fund`, `settle`) **do not enforce auth
 
 ---
 
+---
+
+## Invariants
+
+- `funded_amount <= funding_target` (soft enforced)
+- `status transitions`: 0 → 1 → 2
+- Cannot settle before funded
 | Step | Command | Fails if… |
 |------|---------|-----------|
 | Format | `cargo fmt --all -- --check` | any file is not formatted |
