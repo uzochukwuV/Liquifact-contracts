@@ -96,8 +96,30 @@ Records an investor contribution. Transitions to `status = 1` when
 
 - **init** — Create an invoice escrow (invoice id, SME address, amount, yield bps, maturity). Emits `init` event.
 - **get_escrow** — Read current escrow state.
-- **fund** — Record investor funding; status becomes "funded" when target is met. Emits `fund` event.
-- **settle** — Mark escrow as settled (buyer paid; investors receive principal + yield). Emits `settle` event.
+- **get_version** — Return the stored schema version number.
+- **fund** — Record investor funding; status becomes "funded" when target is met.
+- **settle** — Mark escrow as settled (buyer paid; investors receive principal + yield).
+- **migrate** — Upgrade storage from an older schema version to the current one (see below).
+
+### Maturity gate
+
+`settle` enforces two guards before advancing status to `settled (2)`:
+
+1. **Funding check** — `status` must equal `1` (fully funded). Attempting to settle an unfunded escrow panics with `"Escrow must be funded before settlement"`.
+2. **Time check** — `env.ledger().timestamp()` must be **≥ `maturity`**. Attempting to settle before the invoice is due panics with `"Cannot settle before maturity timestamp"`.
+
+`env.ledger().timestamp()` is the canonical Soroban on-chain clock. It is set by the Stellar network and **cannot be manipulated by the contract caller**, making it safe to use as a time gate.
+
+| Ledger time vs maturity | Status | Result |
+|-------------------------|--------|--------|
+| `now < maturity`        | funded | panic — premature settlement blocked |
+| `now == maturity`       | funded | success |
+| `now > maturity`        | funded | success |
+| any                     | open   | panic — not yet funded |
+
+Setting `maturity = 0` effectively disables the time lock (any timestamp ≥ 0).
+
+---
 
 ### Events
 
